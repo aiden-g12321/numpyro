@@ -9,6 +9,7 @@ from itertools import zip_longest
 import os
 import random
 import re
+import time
 from threading import Lock
 from typing import Any, Callable, Generator, Literal, Optional
 import warnings
@@ -232,7 +233,11 @@ def cached_by(outer_fn, *keys):
 
 
 def progress_bar_factory(
-    num_samples: int, num_chains: int, progress_rate: int, diagnostics_fn=None
+    num_samples: int,
+    num_chains: int,
+    progress_rate: int,
+    diagnostics_fn=None,
+    dynamic_rate: bool = False,
 ) -> Callable:
     """Factory that builds a progress bar decorator along
     with the `set_tqdm_description` and `close_tqdm` functions.
@@ -241,6 +246,12 @@ def progress_bar_factory(
         current sampler state (materialized as numpy arrays via :func:`io_callback`)
         and returns a diagnostics string to display in the progress bar postfix.
         Called every ``progress_rate`` iterations.
+    :param dynamic_rate: when ``True``, display updates are throttled by wall-clock
+        time (``mininterval=0.1 s``, matching tqdm's default) rather than by a fixed
+        iteration count.  Increments that arrive within the interval are accumulated
+        and flushed on the next visible update.  This mirrors the single-chain tqdm
+        behaviour: slow sampling → update every step; fast sampling → update every
+        ``~100 ms`` worth of steps.
     """
 
     remainder = num_samples % progress_rate
@@ -254,6 +265,12 @@ def progress_bar_factory(
         tqdm_bars[chain] = tqdm_auto(range(num_samples), position=chain)
         tqdm_bars[chain].set_description("Compiling.. ", refresh=True)
 
+    # Per-chain state for dynamic (time-based) throttling.
+    if dynamic_rate:
+        _min_interval = 0.1  # seconds – same as tqdm's default mininterval
+        _accumulated = [0] * num_chains  # increments not yet pushed to tqdm
+        _last_display = [0.0] * num_chains  # time.monotonic() of last display
+
     def _update_tqdm(increment, chain):
         increment = int(increment)
         chain = int(chain)
@@ -263,13 +280,26 @@ def progress_bar_factory(
                 chain = idx_counter
                 idx_counter += 1
         tqdm_bars[chain].set_description(f"Running chain {chain}", refresh=False)
-        tqdm_bars[chain].update(increment)
+        if dynamic_rate:
+            _accumulated[chain] += increment
+            now = time.monotonic()
+            if now - _last_display[chain] >= _min_interval:
+                tqdm_bars[chain].update(_accumulated[chain])
+                _accumulated[chain] = 0
+                _last_display[chain] = now
+        else:
+            tqdm_bars[chain].update(increment)
         return chain
 
     def _close_tqdm(increment, chain):
         increment = int(increment)
         chain = int(chain)
-        tqdm_bars[chain].update(increment)
+        if dynamic_rate:
+            # Flush any accumulated increments together with the closing remainder.
+            tqdm_bars[chain].update(_accumulated[chain] + increment)
+            _accumulated[chain] = 0
+        else:
+            tqdm_bars[chain].update(increment)
         tqdm_bars[chain].close()
 
     def _update_progress_bar(iter_num, chain):
@@ -298,10 +328,18 @@ def progress_bar_factory(
         return chain
 
     if diagnostics_fn is not None:
+        if dynamic_rate:
+            _last_diag_display = [0.0] * num_chains
+
         # Host-side callback: receives materialized (numpy) state + assigned chain id,
         # formats a diagnostics string and updates the tqdm postfix.
         def _diag_io_callback(state, chain):
             chain = int(chain)
+            if dynamic_rate:
+                now = time.monotonic()
+                if now - _last_diag_display[chain] < _min_interval:
+                    return  # skip: not enough time has passed since last display
+                _last_diag_display[chain] = now
             try:
                 diag_str = diagnostics_fn(state)
                 tqdm_bars[chain].set_postfix_str(diag_str, refresh=False)
@@ -442,11 +480,16 @@ def fori_collect(
 
     elif num_chains > 1:
         diagnostics_fn = progbar_opts.pop("diagnostics_fn", None)
+        dense_progress_bar = progbar_opts.pop("dense_progress_bar", False)
         # Adapt: the single-chain path calls diagnostics_fn((state,)), but the factory
         # passes state directly from result[0][0], so wrap it here.
         pbar_diag_fn = (lambda s: diagnostics_fn((s,))) if diagnostics_fn is not None else None
         progress_bar_fori_loop = progress_bar_factory(
-            upper, num_chains, progress_rate, diagnostics_fn=pbar_diag_fn
+            upper,
+            num_chains,
+            progress_rate,
+            diagnostics_fn=pbar_diag_fn,
+            dynamic_rate=dense_progress_bar,
         )
         _body_fn_pbar = progress_bar_fori_loop(lambda i, vals: _body_fn(i, *vals))
 

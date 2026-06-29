@@ -308,6 +308,13 @@ class MCMC(object):
         same information shown automatically for single-chain runs. Has no effect when
         ``num_chains == 1`` (diagnostics are always shown in that case). Defaults to
         ``False``.
+    :param bool dense_progress_bar: If set to `True` and ``num_chains > 1``, the multi-chain
+        progress bar updates every iteration (via :func:`jax.experimental.io_callback`) rather
+        than the default of every ``progress_rate`` iterations (~5 % of total). This makes the
+        parallel-chain bars behave like the single-chain bar, where tqdm's own rate-limiting
+        controls the visible refresh frequency. Note that firing a callback every step adds
+        some overhead; on accelerators with many steps this may slow sampling. Has no effect
+        when ``num_chains == 1``. Defaults to ``False``.
 
     .. note:: It is possible to mix parallel and vectorized sampling, i.e., run vectorized chains
         on multiple devices using explicit `pmap`. Currently, doing so requires disabling the
@@ -350,6 +357,7 @@ class MCMC(object):
         progress_rate=None,
         jit_model_args=False,
         show_diagnostics=False,
+        dense_progress_bar=False,
     ):
         self.sampler = sampler
         self._sample_field = sampler.sample_field
@@ -395,6 +403,7 @@ class MCMC(object):
         self.progress_rate = progress_rate
         self._jit_model_args = jit_model_args
         self._show_diagnostics = show_diagnostics
+        self._dense_progress_bar = dense_progress_bar
         self._states = None
         self._states_flat = None
         # HMCState returned by last run
@@ -531,6 +540,13 @@ class MCMC(object):
         pbar_diagnostics_fn = diagnostics if (
             fori_num_chains == 1 or self._show_diagnostics
         ) else None
+        # dense_progress_bar forces io_callback every step on the parallel path so the
+        # multi-chain bars refresh as often as single-chain bars (where tqdm's own rate
+        # limiting controls the visible update frequency).
+        effective_progress_rate = (
+            1 if (fori_num_chains > 1 and self._dense_progress_bar)
+            else self.progress_rate
+        )
         collect_vals = fori_collect(
             lower_idx,
             upper_idx,
@@ -540,13 +556,16 @@ class MCMC(object):
                 postprocess_fn, collect_fields, remove_sites
             ),
             progbar=self.progress_bar,
-            progress_rate=self.progress_rate,
+            progress_rate=effective_progress_rate,
             return_last_val=True,
             thinning=self.thinning,
             collection_size=collection_size,
             progbar_desc=progbar_desc,
             diagnostics_fn=pbar_diagnostics_fn,
             num_chains=fori_num_chains,
+            # Tell progress_bar_factory to use time-based (tqdm-like) throttling
+            # instead of firing a display update every step.
+            dense_progress_bar=(fori_num_chains > 1 and self._dense_progress_bar),
         )
         states, last_val = collect_vals
         # Get first argument of type `HMCState`
