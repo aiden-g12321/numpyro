@@ -262,7 +262,11 @@ def progress_bar_factory(
     # this prevents races that assign multiple chains to a progress bar
     lock = Lock()
     for chain in range(num_chains):
-        tqdm_bars[chain] = tqdm_auto(range(num_samples), position=chain)
+        # dynamic_rate (dense_progress_bar) uses plain tqdm.tqdm to match the
+        # single-chain bar and avoid the Jupyter widget serialization overhead that
+        # tqdm_auto incurs on every update() call inside a notebook.
+        bar_cls = tqdm.tqdm if dynamic_rate else tqdm_auto
+        tqdm_bars[chain] = bar_cls(range(num_samples), position=chain)
         tqdm_bars[chain].set_description("Compiling.. ", refresh=True)
 
     # Per-chain state for dynamic (time-based) throttling.
