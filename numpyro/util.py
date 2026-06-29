@@ -262,10 +262,7 @@ def progress_bar_factory(
     # this prevents races that assign multiple chains to a progress bar
     lock = Lock()
     for chain in range(num_chains):
-        # dynamic_rate uses plain tqdm (text) to avoid the heavy Jupyter widget
-        # rendering overhead that tqdm_auto incurs on every update call.
-        bar_cls = tqdm.tqdm if dynamic_rate else tqdm_auto
-        tqdm_bars[chain] = bar_cls(range(num_samples), position=chain)
+        tqdm_bars[chain] = tqdm_auto(range(num_samples), position=chain)
         tqdm_bars[chain].set_description("Compiling.. ", refresh=True)
 
     # Per-chain state for dynamic (time-based) throttling.
@@ -275,6 +272,8 @@ def progress_bar_factory(
         _last_display = [0.0] * num_chains  # time.monotonic() of last display
 
     def _update_tqdm(increment, chain):
+        # Called only on the first iteration (iter_num == 1) to assign a chain ID.
+        # Uses ordered=True so the assigned ID is available as a carry for subsequent steps.
         increment = int(increment)
         chain = int(chain)
         if chain == -1:
@@ -282,13 +281,16 @@ def progress_bar_factory(
             with lock:
                 chain = idx_counter
                 idx_counter += 1
-            # First-call init: switch description from "Compiling.." and return.
-            # Nothing to accumulate yet (increment is 0 on this call).
-            tqdm_bars[chain].set_description(f"Running chain {chain}", refresh=True)
-            return chain
+        tqdm_bars[chain].set_description(f"Running chain {chain}", refresh=True)
+        return chain
+
+    def _update_tqdm_step(increment, chain):
+        # Called every progress_rate steps for the actual bar update.
+        # Returns nothing — fired with ordered=False so XLA does not block waiting
+        # for this callback to complete.
+        increment = int(increment)
+        chain = int(chain)
         if dynamic_rate:
-            # Hot path — called every step. Keep tqdm API calls out of here
-            # unless the 100 ms display window has elapsed.
             _accumulated[chain] += increment
             now = time.monotonic()
             if now - _last_display[chain] >= _min_interval:
@@ -298,17 +300,13 @@ def progress_bar_factory(
         else:
             tqdm_bars[chain].set_description(f"Running chain {chain}", refresh=False)
             tqdm_bars[chain].update(increment)
-        return chain
 
     def _close_tqdm(increment, chain):
-        increment = int(increment)
         chain = int(chain)
-        if dynamic_rate:
-            # Flush any accumulated increments together with the closing remainder.
-            tqdm_bars[chain].update(_accumulated[chain] + increment)
-            _accumulated[chain] = 0
-        else:
-            tqdm_bars[chain].update(increment)
+        # Force the bar to 100 % regardless of any unordered update callbacks that
+        # may still be in flight (they become no-ops once the bar is closed).
+        tqdm_bars[chain].n = num_samples
+        tqdm_bars[chain].refresh()
         tqdm_bars[chain].close()
 
     def _update_progress_bar(iter_num, chain):
@@ -316,16 +314,19 @@ def progress_bar_factory(
         Usage: carry = progress_bar((iter_num, progress_rate), carry)
         """
 
+        # Step 1: assign chain ID (ordered=True, returns chain scalar needed by carry).
         chain = lax.cond(
             iter_num == 1,
-            lambda _: io_callback(_update_tqdm, jnp.array(0), 0, chain),
+            lambda _: io_callback(_update_tqdm, jnp.array(0), 0, chain, ordered=True),
             lambda _: chain,
             operand=None,
         )
-        chain = lax.cond(
+        # Per-step update: ordered=False so XLA never blocks waiting for Python.
+        # chain is already assigned from the step-1 init above; no return value needed.
+        _ = lax.cond(
             iter_num % progress_rate == 0,
-            lambda _: io_callback(_update_tqdm, jnp.array(0), progress_rate, chain),
-            lambda _: chain,
+            lambda _: io_callback(_update_tqdm_step, None, progress_rate, chain, ordered=False),
+            lambda _: None,
             operand=None,
         )
         _ = lax.cond(
@@ -370,7 +371,7 @@ def progress_bar_factory(
                 state = result[0][0]
                 _ = lax.cond(
                     ((i + 1) % progress_rate == 0) | ((i + 1) == num_samples),
-                    lambda _: io_callback(_diag_io_callback, None, state, chain),
+                    lambda _: io_callback(_diag_io_callback, None, state, chain, ordered=False),
                     lambda _: None,
                     operand=None,
                 )
