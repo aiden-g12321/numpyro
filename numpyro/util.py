@@ -262,7 +262,10 @@ def progress_bar_factory(
     # this prevents races that assign multiple chains to a progress bar
     lock = Lock()
     for chain in range(num_chains):
-        tqdm_bars[chain] = tqdm_auto(range(num_samples), position=chain)
+        # dynamic_rate uses plain tqdm (text) to avoid the heavy Jupyter widget
+        # rendering overhead that tqdm_auto incurs on every update call.
+        bar_cls = tqdm.tqdm if dynamic_rate else tqdm_auto
+        tqdm_bars[chain] = bar_cls(range(num_samples), position=chain)
         tqdm_bars[chain].set_description("Compiling.. ", refresh=True)
 
     # Per-chain state for dynamic (time-based) throttling.
@@ -279,8 +282,13 @@ def progress_bar_factory(
             with lock:
                 chain = idx_counter
                 idx_counter += 1
-        tqdm_bars[chain].set_description(f"Running chain {chain}", refresh=False)
+            # First-call init: switch description from "Compiling.." and return.
+            # Nothing to accumulate yet (increment is 0 on this call).
+            tqdm_bars[chain].set_description(f"Running chain {chain}", refresh=True)
+            return chain
         if dynamic_rate:
+            # Hot path — called every step. Keep tqdm API calls out of here
+            # unless the 100 ms display window has elapsed.
             _accumulated[chain] += increment
             now = time.monotonic()
             if now - _last_display[chain] >= _min_interval:
@@ -288,6 +296,7 @@ def progress_bar_factory(
                 _accumulated[chain] = 0
                 _last_display[chain] = now
         else:
+            tqdm_bars[chain].set_description(f"Running chain {chain}", refresh=False)
             tqdm_bars[chain].update(increment)
         return chain
 
