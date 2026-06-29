@@ -165,6 +165,13 @@ def _get_progbar_desc_str(num_warmup, phase, i):
     return "warmup" if i < num_warmup else "sample"
 
 
+def _get_progbar_desc_str_with_chain(num_warmup, phase, chain_id, i):
+    prefix = f"chain {chain_id}"
+    if phase is not None:
+        return f"{prefix} {phase}"
+    return f"{prefix} warmup" if i < num_warmup else f"{prefix} sample"
+
+
 def _get_value_from_index(xs, i):
     return jax.tree.map(lambda x: x[i], xs)
 
@@ -295,6 +302,12 @@ class MCMC(object):
         on a same sized but different dataset will not result in additional compilation cost.
         Note that currently, this does not take effect for the case ``num_chains > 1``
         and ``chain_method == 'parallel'``.
+    :param bool show_diagnostics: If set to `True` and ``num_chains > 1``, each chain is
+        run sequentially with its own labeled progress bar that displays real-time sampling
+        diagnostics (step size, number of leapfrog steps, acceptance probability) — the
+        same information shown automatically for single-chain runs. Has no effect when
+        ``num_chains == 1`` (diagnostics are always shown in that case). Defaults to
+        ``False``.
 
     .. note:: It is possible to mix parallel and vectorized sampling, i.e., run vectorized chains
         on multiple devices using explicit `pmap`. Currently, doing so requires disabling the
@@ -336,6 +349,7 @@ class MCMC(object):
         progress_bar=True,
         progress_rate=None,
         jit_model_args=False,
+        show_diagnostics=False,
     ):
         self.sampler = sampler
         self._sample_field = sampler.sample_field
@@ -380,6 +394,7 @@ class MCMC(object):
             self.progress_bar = False
         self.progress_rate = progress_rate
         self._jit_model_args = jit_model_args
+        self._show_diagnostics = show_diagnostics
         self._states = None
         self._states_flat = None
         # HMCState returned by last run
@@ -463,7 +478,9 @@ class MCMC(object):
         except TypeError:
             return None
 
-    def _single_chain_mcmc(self, init, args, kwargs, collect_fields, remove_sites):
+    def _single_chain_mcmc(
+        self, init, args, kwargs, collect_fields, remove_sites, chain_id=None
+    ):
         rng_key, init_state, init_params = init
         # Check if _sample_fn is None, then we need to initialize the sampler.
         if init_state is None or (getattr(self.sampler, "_sample_fn", None) is None):
@@ -493,6 +510,27 @@ class MCMC(object):
             if collection_size is None
             else collection_size // self.thinning
         )
+        # chain_id is set for the sequential+show_diagnostics path, forcing the single-chain
+        # tqdm branch in fori_collect (so each chain gets a labeled "chain N" bar).
+        if chain_id is not None:
+            fori_num_chains = 1
+            progbar_desc = partial(
+                _get_progbar_desc_str_with_chain, lower_idx, phase, chain_id
+            )
+        else:
+            fori_num_chains = (
+                self.num_chains
+                if (callable(self.chain_method) or self.chain_method == "parallel")
+                else 1
+            )
+            progbar_desc = partial(_get_progbar_desc_str, lower_idx, phase)
+        # For the parallel (pmap) path fori_num_chains > 1 and diagnostics are shown
+        # via io_callback inside progress_bar_factory — but only when show_diagnostics=True.
+        # For the single-chain tqdm path (fori_num_chains == 1) diagnostics are always
+        # available via the existing tqdm.trange mechanism, so always pass them.
+        pbar_diagnostics_fn = diagnostics if (
+            fori_num_chains == 1 or self._show_diagnostics
+        ) else None
         collect_vals = fori_collect(
             lower_idx,
             upper_idx,
@@ -506,11 +544,9 @@ class MCMC(object):
             return_last_val=True,
             thinning=self.thinning,
             collection_size=collection_size,
-            progbar_desc=partial(_get_progbar_desc_str, lower_idx, phase),
-            diagnostics_fn=diagnostics,
-            num_chains=self.num_chains
-            if (callable(self.chain_method) or self.chain_method == "parallel")
-            else 1,
+            progbar_desc=progbar_desc,
+            diagnostics_fn=pbar_diagnostics_fn,
+            num_chains=fori_num_chains,
         )
         states, last_val = collect_vals
         # Get first argument of type `HMCState`
@@ -711,9 +747,32 @@ class MCMC(object):
             states_flat, last_state = partial_map_fn(map_args)
             states = jax.tree.map(lambda x: x[jnp.newaxis, ...], states_flat)
         else:
-            if self.chain_method == "sequential":
+            if self._show_diagnostics and self.chain_method == "sequential":
+                # Sequential chains: run one at a time with a labeled progress bar
+                # ("chain N warmup / chain N sample") so each chain's diagnostics are
+                # clearly attributed. Parallel chains get diagnostics via io_callback
+                # inside progress_bar_factory without any change to chain_method.
+                all_states = []
+                all_last_states = []
+                for chain_idx in range(self.num_chains):
+                    chain_init = jit(_get_value_from_index)(map_args, chain_idx)
+                    s, ls = self._single_chain_mcmc(
+                        chain_init,
+                        args,
+                        kwargs,
+                        collect_fields,
+                        remove_sites,
+                        chain_id=chain_idx,
+                    )
+                    all_states.append(s)
+                    all_last_states.append(ls)
+                states = jax.tree.map(lambda *xs: jnp.stack(xs), *all_states)
+                last_state = jax.tree.map(lambda *xs: jnp.stack(xs), *all_last_states)
+            elif self.chain_method == "sequential":
                 states, last_state = _laxmap(partial_map_fn, map_args)
             elif self.chain_method == "parallel":
+                # show_diagnostics=True is handled inside _single_chain_mcmc by passing
+                # diagnostics_fn through to progress_bar_factory via fori_collect.
                 states, last_state = pmap(partial_map_fn)(map_args)
             elif callable(self.chain_method):
                 states, last_state = self.chain_method(partial_map_fn)(map_args)

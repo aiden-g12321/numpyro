@@ -232,10 +232,15 @@ def cached_by(outer_fn, *keys):
 
 
 def progress_bar_factory(
-    num_samples: int, num_chains: int, progress_rate: int
+    num_samples: int, num_chains: int, progress_rate: int, diagnostics_fn=None
 ) -> Callable:
     """Factory that builds a progress bar decorator along
-    with the `set_tqdm_description` and `close_tqdm` functions
+    with the `set_tqdm_description` and `close_tqdm` functions.
+
+    :param diagnostics_fn: optional callable ``(state) -> str`` that receives the
+        current sampler state (materialized as numpy arrays via :func:`io_callback`)
+        and returns a diagnostics string to display in the progress bar postfix.
+        Called every ``progress_rate`` iterations.
     """
 
     remainder = num_samples % progress_rate
@@ -292,6 +297,17 @@ def progress_bar_factory(
         )
         return chain
 
+    if diagnostics_fn is not None:
+        # Host-side callback: receives materialized (numpy) state + assigned chain id,
+        # formats a diagnostics string and updates the tqdm postfix.
+        def _diag_io_callback(state, chain):
+            chain = int(chain)
+            try:
+                diag_str = diagnostics_fn(state)
+                tqdm_bars[chain].set_postfix_str(diag_str, refresh=False)
+            except Exception:
+                pass
+
     def progress_bar_fori_loop(func: Callable) -> Callable:
         """Decorator that adds a progress bar to `body_fun` used in `lax.fori_loop`.
         Note that `body_fun` must be looping over a tuple who's first element is `np.arange(num_samples)`.
@@ -302,6 +318,15 @@ def progress_bar_factory(
             (subvals, chain) = vals
             result = func(i, subvals)
             chain = _update_progress_bar(i + 1, chain)
+            if diagnostics_fn is not None:
+                # result[0] is new_val = (state,) or (state, args, kwargs); [0][0] = state
+                state = result[0][0]
+                _ = lax.cond(
+                    ((i + 1) % progress_rate == 0) | ((i + 1) == num_samples),
+                    lambda _: io_callback(_diag_io_callback, None, state, chain),
+                    lambda _: None,
+                    operand=None,
+                )
             return (result, chain)
 
         return wrapper_progress_bar
@@ -416,7 +441,13 @@ def fori_collect(
         )(_body_fn, upper, init_val, collection, start_idx, thinning)
 
     elif num_chains > 1:
-        progress_bar_fori_loop = progress_bar_factory(upper, num_chains, progress_rate)
+        diagnostics_fn = progbar_opts.pop("diagnostics_fn", None)
+        # Adapt: the single-chain path calls diagnostics_fn((state,)), but the factory
+        # passes state directly from result[0][0], so wrap it here.
+        pbar_diag_fn = (lambda s: diagnostics_fn((s,))) if diagnostics_fn is not None else None
+        progress_bar_fori_loop = progress_bar_factory(
+            upper, num_chains, progress_rate, diagnostics_fn=pbar_diag_fn
+        )
         _body_fn_pbar = progress_bar_fori_loop(lambda i, vals: _body_fn(i, *vals))
 
         def loop_fn(collection):
